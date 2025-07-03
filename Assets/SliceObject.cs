@@ -2,44 +2,52 @@ using System.Collections.Generic;
 using UnityEngine;
 using EzySlice;
 
+/// <summary>
+/// Corta objetos “fatiáveis” (Fruit-Ninja style) no VR.
+/// A lâmina é definida por dois pontos (start e end) presas no controller.
+/// Usa o EzySlice para separar a malha em duas metades.
+/// </summary>
 public class SliceObject : MonoBehaviour
 {
+    // ─────────── Campos configuráveis no Inspector ───────────
+
     [Header("Pontos de corte")]
-    public Transform startSlicePoint;   // ponta inicial da lâmina
-    public Transform endSlicePoint;     // ponta final da lâmina
+    public Transform startSlicePoint;   // posição da ponta inicial da lâmina
+    public Transform endSlicePoint;     // posição da ponta final da lâmina
 
     [Header("Configurações")]
-    public LayerMask sliceableLayer;    // layer dos objetos fatiáveis
-    public VelocityEstimator velocityEstimator;
-    public Material crossSectionMaterial;
+    public LayerMask sliceableLayer;    // somente objetos nessa Layer podem ser cortados
+    public VelocityEstimator velocityEstimator;  // mede a velocidade do controller
+    public Material crossSectionMaterial;        // material da “parte interna” do corte
 
-    [Tooltip("Força de impulso aplicada às metades (N·s)")]
-    public float cutForce = 2f;
+    [Tooltip("Impulso dado às metades após o corte")]
+    public float cutForce = 2f;         // força do empurrão
 
-    [Tooltip("Velocidade mínima (m/s) para considerar que houve corte")]
-    public float minCutSpeed = 0.25f;
+    [Tooltip("Velocidade mínima para considerar que houve corte")]
+    public float minCutSpeed = 0.25f;   // evita cortes acidentais quando o controle está parado
 
-    [Tooltip("Raio virtual da lâmina (m) – usado no CapsuleCast")]
-    public float bladeRadius = 0.02f;
+    [Tooltip("Raio virtual da lâmina (para o CapsuleCast)")]
+    public float bladeRadius = 0.02f;   // espessura do feixe que detecta o acerto
 
-    // cache para não cortar o mesmo objeto duas vezes no mesmo frame
+    // Guarda quem já foi cortado nesse frame, para não fatiar duas vezes
     private readonly HashSet<GameObject> _alreadySliced = new HashSet<GameObject>();
 
+    // ─────────── Loop de Física ───────────
     private void FixedUpdate()
     {
-        // estimativa da velocidade do controlador
+        // 1) Mede quão rápido o controller está se movendo
         Vector3 velocity = velocityEstimator.GetVelocityEstimate();
 
-        // ignora se estamos “parados”
+        // Se a mão está lenta, sai sem cortar nada
         if (velocity.magnitude < minCutSpeed)
             return;
 
-        // direção do movimento da lâmina
+        // 2) Define a direção da lâmina entre os dois pontos
         Vector3 dir = endSlicePoint.position - startSlicePoint.position;
-        float distance = dir.magnitude;
         dir.Normalize();
 
-        // CapsuleCast pega objetos pequenos que Linecast costuma “pular”
+        // 3) Verifica se a lâmina intercepta algum objeto fatiável
+        //    CapsuleCast é mais “gordo” que Linecast e acerta objetos pequenos
         RaycastHit[] hits = Physics.CapsuleCastAll(
             startSlicePoint.position,
             endSlicePoint.position,
@@ -48,64 +56,68 @@ public class SliceObject : MonoBehaviour
             0f,
             sliceableLayer);
 
-        if (hits.Length == 0)
-            return;
+        if (hits.Length == 0) return; // nada foi atingido
 
-        _alreadySliced.Clear();
+        _alreadySliced.Clear();       // limpa cache por frame
 
         foreach (RaycastHit hit in hits)
         {
             GameObject target = hit.transform.gameObject;
 
-            // evita fatiar duas vezes o mesmo objeto no mesmo FixedUpdate
+            // pula se já cortamos esse objeto neste FixedUpdate
             if (_alreadySliced.Contains(target))
                 continue;
 
-            Slice(target, velocity);
-            _alreadySliced.Add(target);
+            Slice(target, velocity);     // tenta fatiar
+            _alreadySliced.Add(target);  // marca como já cortado
         }
     }
 
+    // ─────────── Faz o corte propriamente dito ───────────
     private void Slice(GameObject target, Vector3 velocity)
     {
-        // plano de corte: normal = trajetória × velocidade
+        // 1) Calcula o plano de corte.
+        //    Normal = (trajetória da lâmina) × (direção da mão)
         Vector3 sliceDir = endSlicePoint.position - startSlicePoint.position;
         Vector3 planeNormal = Vector3.Cross(sliceDir, velocity);
 
-        // se a normal ficou quase zero, aborta
+        // Se a normal ficou quase zero, aborta (evita divisões degeneradas)
         if (planeNormal.sqrMagnitude < 1e-4f)
             return;
 
-        planeNormal.Normalize();
+        planeNormal.Normalize();   // deixa a normal com comprimento 1
 
-        // corta o objeto
+        // 2) Usa o EzySlice para cortar
         SlicedHull hull = target.Slice(endSlicePoint.position, planeNormal);
-        if (hull == null)
-            return;
+        if (hull == null) return;  // falhou? sai
 
-        // cria metades
+        // 3) Cria as duas metades
         GameObject upperHull = hull.CreateUpperHull(target, crossSectionMaterial);
-        SetupSliceComponent(upperHull, planeNormal);
+        SetupSliceComponent(upperHull,  planeNormal);  // empurra pra cima
 
         GameObject lowerHull = hull.CreateLowerHull(target, crossSectionMaterial);
-        SetupSliceComponent(lowerHull, -planeNormal);
+        SetupSliceComponent(lowerHull, -planeNormal);  // empurra pra baixo
 
-        // remove original
+        // 4) Remove o objeto original
         Destroy(target);
+
+        // 5) Soma pontos no placar
+        ScoreManager.Instance?.AddScore(1);
     }
 
+    // ─────────── Prepara cada metade para “ganhar vida” ───────────
     private void SetupSliceComponent(GameObject sliceObj, Vector3 impulseDir)
     {
-        // mantém a mesma layer/tag do objeto original
+        // Mantém layer e tag iguais ao original (opcional)
         sliceObj.layer = gameObject.layer;
-        sliceObj.tag = gameObject.tag;
+        sliceObj.tag   = gameObject.tag;
 
-        // colisão e física
-        var rb = sliceObj.AddComponent<Rigidbody>();
+        // Adiciona física
+        var rb  = sliceObj.AddComponent<Rigidbody>();
         var col = sliceObj.AddComponent<MeshCollider>();
-        col.convex = true;
+        col.convex = true;                 // obrigatório para MeshCollider funcionar com Rigidbody
 
-        // dá um pequeno empurrão na direção da normal do corte
+        // Dá um empurrão leve para separar visualmente as metades
         rb.AddForce(impulseDir * cutForce, ForceMode.Impulse);
     }
 }
